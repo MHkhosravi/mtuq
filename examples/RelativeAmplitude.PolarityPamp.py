@@ -70,6 +70,19 @@ if __name__ == '__main__':
         project_to_vertical=False,   # scalar along-ray P amplitude (see docstring)
         )
 
+    # To additionally constrain the source with S/P amplitude ratios (beyond
+    # the paper), set lambda_sprat > 0 and supply per-station S/P observations:
+    #
+    #   from mtuq.misfit import relative_pol_pamp_spamp_from_dict
+    #   misfit = PolarityRelPampMisfit(method='taup', taup_model=model,
+    #       lambda_pol=1.0, lambda_pamp=1.0, lambda_sprat=1.0,
+    #       sp_obs_is_log10=False)
+    #   obs = relative_pol_pamp_spamp_from_dict(
+    #       pol_dict, pamp_dict, sprat_dict,
+    #       w_pol_dict, w_pamp_dict, w_sprat_dict, stations)
+    #
+    # (S/P is compared absolutely in log10 space, not max-abs normalized.)
+
     #
     # Read station metadata and download Green's functions for their geometry
     #

@@ -79,17 +79,22 @@ class PolarityRelPampMisfit(object):
         taup_model='ak135',
         lambda_pol=1.0,
         lambda_pamp=1.0,
+        lambda_sprat=0.0,
         norm_pol='L1',
         norm_pamp='L1',
+        norm_sprat='L1',
         project_to_vertical=False,
         distance_mode='epicenter',
+        sp_obs_is_log10=False,
         rho=None,
         vp=None,
+        vs=None,
         **parameters):
 
         # validate cheap parameters first
         self.norm_pol = _validate_norm(norm_pol)
         self.norm_pamp = _validate_norm(norm_pamp)
+        self.norm_sprat = _validate_norm(norm_sprat)
 
         if distance_mode not in ('epicenter', 'ray_path'):
             raise ValueError("distance_mode must be 'epicenter' or 'ray_path'")
@@ -104,9 +109,12 @@ class PolarityRelPampMisfit(object):
         self.taup_model = taup_model
         self.lambda_pol = float(lambda_pol)
         self.lambda_pamp = float(lambda_pamp)
+        self.lambda_sprat = float(lambda_sprat)
         self.project_to_vertical = bool(project_to_vertical)
+        self.sp_obs_is_log10 = bool(sp_obs_is_log10)
         self._rho_user = rho
         self._vp_user = vp
+        self._vs_user = vs
 
         if self.method == 'taup':
             assert self.taup_model is not None
@@ -116,33 +124,39 @@ class PolarityRelPampMisfit(object):
             self._taup = None
 
     def get_observed(self, data):
-        """ Extract observed (pol, pamp, w_pol, w_pamp) arrays from ``data``.
+        """ Extract observations as ``(pol, pamp, sprat, w_pol, w_pamp, w_sprat)``.
 
-        Accepts either a 4-tuple bundle ``(pol_obs, pamp_obs, w_pol, w_pamp)``
-        of equal-length arrays, or a plain polarity array/list (backward
-        compatible: amplitude weights are 0 so only the polarity term is active).
+        Accepts a 6-tuple bundle ``(pol, pamp, sprat, w_pol, w_pamp, w_sprat)``,
+        a 4-tuple bundle ``(pol, pamp, w_pol, w_pamp)`` (S/P set to zero), or a
+        plain polarity array/list (only the polarity term active). ``sprat`` is
+        the observed S/P amplitude ratio (linear, or log10 if
+        ``sp_obs_is_log10``).
         """
+        if _is_observation_bundle(data, 6):
+            return tuple(np.asarray(data[i], dtype=np.float64)
+                         for i in range(6))
+
         if _is_observation_bundle(data, 4):
-            return (np.asarray(data[0], dtype=np.float64),
-                    np.asarray(data[1], dtype=np.float64),
-                    np.asarray(data[2], dtype=np.float64),
-                    np.asarray(data[3], dtype=np.float64))
+            pol = np.asarray(data[0], dtype=np.float64)
+            pamp = np.asarray(data[1], dtype=np.float64)
+            w_pol = np.asarray(data[2], dtype=np.float64)
+            w_pamp = np.asarray(data[3], dtype=np.float64)
+            z = np.zeros(pol.size, dtype=np.float64)
+            return pol, pamp, z.copy(), w_pol, w_pamp, z.copy()
 
         pol_obs = np.asarray(data, dtype=np.float64).ravel()
         n = pol_obs.size
         w_pol = (pol_obs != 0).astype(np.float64)
-        zeros = np.zeros(n, dtype=np.float64)
-        return pol_obs, zeros.copy(), w_pol, zeros.copy()
+        z = np.zeros(n, dtype=np.float64)
+        return pol_obs, z.copy(), z.copy(), w_pol, z.copy(), z.copy()
 
-    def get_predicted(self, greens, sources, return_all=False):
-        """ Predicted P polarity (and amplitude) for each source and station.
+    def _predict(self, greens, sources):
+        """ Predicted (pol_theo, pamp_theo, sprat_theo) for each source/station.
 
-        Returns ``pol_theo`` (shape ``(n_sources, n_sta)``) by default, or
-        ``(pol_theo, pamp_theo)`` when ``return_all=True``. The predicted P
-        amplitude includes ``1/r`` geometric spreading and, if
-        ``project_to_vertical``, a ``cos(incidence)`` vertical projection. The
-        constant ``1/(4 pi rho alpha**3)`` is omitted because it cancels under the
-        max-abs normalization applied in :meth:`get_terms`.
+        ``sprat_theo`` (log10 S/P) is computed only when ``lambda_sprat != 0``;
+        otherwise it is ``None``. P amplitude includes ``1/r`` spreading and,
+        if ``project_to_vertical``, a ``cos(incidence)`` factor. The constant
+        ``1/(4 pi rho alpha**3)`` is omitted (it cancels under normalization).
         """
         mt = self._sources_to_use_array(sources)
 
@@ -157,14 +171,29 @@ class PolarityRelPampMisfit(object):
             mt, takeoff, azimuth,
             spreading=spreading, vertical_cos=vertical_cos)
 
+        sprat_theo = None
+        if self.lambda_sprat != 0.0:
+            sprat_theo = _s_over_p_log10_mt(
+                mt, takeoff, azimuth, self._vp_over_vs(greens))
+
+        return pol_theo, pamp_theo, sprat_theo
+
+    def get_predicted(self, greens, sources, return_all=False):
+        """ Predicted P polarity (and amplitude) for each source and station.
+
+        Returns ``pol_theo`` by default, or ``(pol_theo, pamp_theo)`` when
+        ``return_all=True``.
+        """
+        pol_theo, pamp_theo, _ = self._predict(greens, sources)
         if return_all:
             return pol_theo, pamp_theo
         return pol_theo
 
     def get_terms(self, data, greens, sources):
-        """ Return per-source polarity and relative-P-amplitude misfit terms. """
-        pol_obs, pamp_obs, w_pol, w_pamp = self.get_observed(data)
-        pol_theo, pamp_theo = self.get_predicted(greens, sources, return_all=True)
+        """ Per-source polarity, relative-P-amplitude, and S/P misfit terms. """
+        (pol_obs, pamp_obs, sprat_obs,
+         w_pol, w_pamp, w_sprat) = self.get_observed(data)
+        pol_theo, pamp_theo, sprat_theo = self._predict(greens, sources)
         n_mt = pol_theo.shape[0]
 
         if self.lambda_pol != 0.0:
@@ -187,22 +216,44 @@ class PolarityRelPampMisfit(object):
         else:
             phi_pamp = np.zeros(n_mt, dtype=np.float64)
 
-        return phi_pol, phi_pamp
+        if self.lambda_sprat != 0.0:
+            # S/P is compared absolutely in log10 space (already per-station
+            # instrument- and spreading-independent; no cross-sensor norm)
+            if self.sp_obs_is_log10:
+                vsp = _observed_mask(sprat_obs, w_sprat)
+                obs_log = sprat_obs
+            else:
+                vsp = _observed_mask(sprat_obs, w_sprat, require_positive=True)
+                obs_log = np.log10(np.maximum(
+                    sprat_obs, np.finfo(np.float64).tiny))
+            phi_sprat = _weighted_misfit_term(
+                obs_log[vsp], sprat_theo[:, vsp], w_sprat[vsp],
+                norm=self.norm_sprat)
+        else:
+            phi_sprat = np.zeros(n_mt, dtype=np.float64)
+
+        return phi_pol, phi_pamp, phi_sprat
 
     def __call__(self, data, greens, sources, progress_handle=None,
                  set_attributes=False):
-        phi_pol, phi_pamp = self.get_terms(data, greens, sources)
-        values = self.lambda_pol * phi_pol + self.lambda_pamp * phi_pamp
+        phi_pol, phi_pamp, phi_sprat = self.get_terms(data, greens, sources)
+        values = (self.lambda_pol * phi_pol +
+                  self.lambda_pamp * phi_pamp +
+                  self.lambda_sprat * phi_sprat)
         return values.reshape(-1, 1)
 
     def count_observations(self, data):
-        """ Number of usable polarity and amplitude observations. """
-        pol_obs, pamp_obs, w_pol, w_pamp = self.get_observed(data)
+        """ Number of usable polarity, P-amplitude, and S/P observations. """
+        (pol_obs, pamp_obs, sprat_obs,
+         w_pol, w_pamp, w_sprat) = self.get_observed(data)
         return {
             'pol': int(np.count_nonzero(
                 _observed_mask(pol_obs, w_pol, require_nonzero=True))),
             'pamp': int(np.count_nonzero(
                 _observed_mask(pamp_obs, w_pamp, require_nonzero=False))),
+            'sprat': int(np.count_nonzero(_observed_mask(
+                sprat_obs, w_sprat,
+                require_positive=not self.sp_obs_is_log10))),
         }
 
     def collect_attributes(self, data, greens):
@@ -289,10 +340,104 @@ class PolarityRelPampMisfit(object):
                 return dist
         return dist
 
+    def _vp_over_vs(self, greens):
+        """ vp/vs at each source depth (user override, else AK135). """
+        if self._vp_user is not None and self._vs_user is not None:
+            return np.full(len(greens),
+                           float(self._vp_user) / float(self._vs_user))
+        if self.method != 'taup':
+            raise NotImplementedError(
+                "vp/vs requires method='taup' or explicit vp and vs")
+        out = np.zeros(len(greens), dtype=np.float64)
+        for i, g in enumerate(greens):
+            _, vp, vs = _medium_from_taup_at_depth(
+                self._taup, g.origin.depth_in_m / 1000.0)
+            out[i] = vp / vs
+        return out
+
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+def _s_over_p_log10_mt(mt_array_use, takeoff, azimuth, vp_over_vs):
+    """ Far-field log10(S/P) amplitude ratio for USE moment tensors.
+
+    Uses the SAME takeoff/azimuth as the P wave (per design decision), computing
+    ``S/P = |S| / |P|`` from the far-field radiation patterns. The 1/r geometric
+    spreading cancels in the ratio; the velocity factor does not, giving
+
+        log10(S/P) = log10(|S_rad| / |P_rad|) + 3 * log10(vp/vs)
+
+    The SV/SH radiation bases (in NED, contracting with
+    [NN, EE, DD, NE, ND, ED]) are ported from the reviewed
+    ``PolarityPampSPampRatioMisfit`` implementation. ``vp_over_vs`` is a scalar
+    or a length-``n_sta`` array. Numerator and denominator are floored by machine
+    tiny so isotropic / nodal sources yield a large finite value, not +/-inf.
+    """
+    mt = np.asarray(mt_array_use, dtype=np.float64)
+    if mt.ndim == 1:
+        mt = mt.reshape((1, 6))
+    n_sta = len(takeoff)
+
+    ned = _use_to_ned(mt)
+    th = np.deg2rad(np.asarray(takeoff, dtype=np.float64))
+    ph = np.deg2rad(np.asarray(azimuth, dtype=np.float64))
+
+    vov = np.asarray(vp_over_vs, dtype=np.float64)
+    if vov.size == 1:
+        vov = np.full(n_sta, float(vov.ravel()[0]))
+
+    out = np.zeros((mt.shape[0], n_sta), dtype=np.float64)
+    eps = np.finfo(np.float64).tiny
+
+    for i in range(n_sta):
+        st, ct = np.sin(th[i]), np.cos(th[i])
+        sf, cf = np.sin(ph[i]), np.cos(ph[i])
+        s2t, c2t = np.sin(2.0 * th[i]), np.cos(2.0 * th[i])
+        s2f, c2f = np.sin(2.0 * ph[i]), np.cos(2.0 * ph[i])
+
+        rp_basis = np.array([
+            st * st * cf * cf, st * st * sf * sf, ct * ct,
+            st * st * s2f, s2t * cf, s2t * sf], dtype=np.float64)
+        rsv_basis = np.array([
+            0.5 * s2t * cf * cf, 0.5 * s2t * sf * sf, -0.5 * s2t,
+            0.5 * s2t * s2f, c2t * cf, c2t * sf], dtype=np.float64)
+        rsh_basis = np.array([
+            -0.5 * st * s2f, 0.5 * st * s2f, 0.0,
+            st * c2f, -ct * sf, ct * cf], dtype=np.float64)
+
+        Rp = np.dot(ned, rp_basis)
+        Rsv = np.dot(ned, rsv_basis)
+        Rsh = np.dot(ned, rsh_basis)
+        s_mag = np.sqrt(Rsv ** 2 + Rsh ** 2)
+
+        ratio = np.maximum(s_mag, eps) / np.maximum(np.abs(Rp), eps)
+        out[:, i] = np.log10(ratio) + 3.0 * np.log10(vov[i])
+
+    return out
+
+
+def _medium_from_taup_at_depth(taup, depth_km):
+    """ Density, P and S velocity (SI units) at ``depth_km`` from a TauP model. """
+    layers = taup.model.s_mod.v_mod.layers
+    for layer in layers:
+        z1 = float(layer['top_depth'])
+        z2 = float(layer['bot_depth'])
+        if z1 <= depth_km <= z2:
+            frac = 0.0 if z2 == z1 else (depth_km - z1) / (z2 - z1)
+            vp = (float(layer['top_p_velocity']) +
+                  frac * (float(layer['bot_p_velocity']) -
+                          float(layer['top_p_velocity'])))
+            vs = (float(layer['top_s_velocity']) +
+                  frac * (float(layer['bot_s_velocity']) -
+                          float(layer['top_s_velocity'])))
+            rho = (float(layer['top_density']) +
+                   frac * (float(layer['bot_density']) -
+                           float(layer['top_density'])))
+            return rho * 1000.0, vp * 1000.0, vs * 1000.0
+    raise ValueError('Depth %s km is outside the TauP model range' % depth_km)
+
 
 def _validate_norm(value):
     norm = str(value).upper()
@@ -321,12 +466,15 @@ def _use_to_ned(mt_array):
     ])
 
 
-def _observed_mask(values, weights, require_nonzero=False):
+def _observed_mask(values, weights, require_nonzero=False,
+                   require_positive=False):
     """ Stations with finite observations and strictly positive weight. """
     values = np.asarray(values, dtype=np.float64)
     weights = np.asarray(weights, dtype=np.float64)
     valid = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
-    if require_nonzero:
+    if require_positive:
+        valid &= values > 0.0
+    elif require_nonzero:
         valid &= values != 0.0
     return valid
 
@@ -505,6 +653,49 @@ def _pol_pamp_mt(mt_array_use, takeoff, azimuth, spreading=None,
         p_amp[:, i] = amp
 
     return polarities, p_amp
+
+
+def _obs_and_weight(value_dict, weight_dict, station):
+    """ (value, weight) for a station; absent -> (0, 0); weight_dict None -> 1
+    where the value is present, else 0. """
+    _MISSING = object()
+    v = _lookup_station_value(value_dict, station, default=_MISSING)
+    present = v is not _MISSING
+    val = float(v) if present else 0.0
+    if weight_dict is None:
+        w = 1.0 if present else 0.0
+    else:
+        w = float(_lookup_station_value(weight_dict, station, default=0.0))
+    return val, w
+
+
+def relative_pol_pamp_spamp_from_dict(
+        dict_polarity, dict_p_amp, dict_sp_ratio,
+        dict_polarity_weights, dict_p_amp_weights, dict_sp_ratio_weights,
+        stations):
+    """ Aligned observation bundle including S/P amplitude ratio.
+
+    Returns ``(pol, pamp, sprat, w_pol, w_pamp, w_sprat)``, each a
+    length-``len(stations)`` array. Absent stations get value 0 and weight 0;
+    a None weights dict defaults to weight 1 where the value is present.
+    """
+    n = len(stations)
+    pol = np.zeros(n, dtype=np.float64)
+    pamp = np.zeros(n, dtype=np.float64)
+    sprat = np.zeros(n, dtype=np.float64)
+    w_pol = np.zeros(n, dtype=np.float64)
+    w_pamp = np.zeros(n, dtype=np.float64)
+    w_sprat = np.zeros(n, dtype=np.float64)
+
+    for i, station in enumerate(stations):
+        pol[i], w_pol[i] = _obs_and_weight(
+            dict_polarity, dict_polarity_weights, station)
+        pamp[i], w_pamp[i] = _obs_and_weight(
+            dict_p_amp, dict_p_amp_weights, station)
+        sprat[i], w_sprat[i] = _obs_and_weight(
+            dict_sp_ratio, dict_sp_ratio_weights, station)
+
+    return pol, pamp, sprat, w_pol, w_pamp, w_sprat
 
 
 def _lookup_station_value(mapping, station, default=None):

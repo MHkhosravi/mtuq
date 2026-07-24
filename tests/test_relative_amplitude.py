@@ -18,6 +18,8 @@ from mtuq.misfit.relative_amplitude import (
     _pol_pamp_mt,
     _max_abs_normalize,
     _weighted_misfit_term,
+    _s_over_p_log10_mt,
+    _medium_from_taup_at_depth,
 )
 
 
@@ -152,6 +154,42 @@ def test_vertical_projection_scales_amplitude():
 
 
 # ---------------------------------------------------------------------------
+# S/P amplitude-ratio radiation (log10 space)
+# ---------------------------------------------------------------------------
+
+def test_medium_from_taup_positive_and_vp_gt_vs():
+    from obspy.taup import TauPyModel
+    rho, vp, vs = _medium_from_taup_at_depth(TauPyModel('ak135'), 5.0)
+    assert rho > 0 and vp > 0 and vs > 0 and vp > vs
+
+
+def test_isotropic_sp_ratio_is_finite_and_very_negative():
+    # isotropic sources radiate NO S -> |S|=0 -> floored -> large finite negative
+    iso = np.array([[1., 1., 1., 0., 0., 0.]])
+    sprat = _s_over_p_log10_mt(
+        iso, np.array([30., 60.]), np.array([20., 200.]), np.array([1.7, 1.7]))
+    assert np.all(np.isfinite(sprat[0]))
+    assert np.all(sprat[0] < -5.0)
+
+
+def test_sp_velocity_factor_is_additive_in_log():
+    mt = np.array([[0.2, -1., 0.5, 0.3, -0.2, 0.1]])
+    takeoff = np.array([40., 70.])
+    azimuth = np.array([15., 190.])
+    s1 = _s_over_p_log10_mt(mt, takeoff, azimuth, np.array([1.7, 1.7]))
+    s2 = _s_over_p_log10_mt(mt, takeoff, azimuth, np.array([1.9, 1.9]))
+    np.testing.assert_allclose(s2[0] - s1[0], 3.0 * np.log10(1.9 / 1.7))
+
+
+def test_sp_ratio_finite_when_p_is_nodal():
+    # M_ND=1: Rp = sin(2th) cos(phi); at th=45, phi=90 -> Rp ~ 0
+    mt = np.array([[0., 0., 0., 1., 0., 0.]])
+    sprat = _s_over_p_log10_mt(
+        mt, np.array([45.]), np.array([90.]), np.array([1.7]))
+    assert np.isfinite(sprat[0, 0])
+
+
+# ---------------------------------------------------------------------------
 # Misfit math: max-abs normalization + weighted L1/L2 term
 # ---------------------------------------------------------------------------
 
@@ -218,21 +256,34 @@ def test_weighted_term_zero_weight_station_excluded():
 
 def test_get_observed_bundle_roundtrip():
     m = PolarityRelPampMisfit(method='taup')
+    # 4-tuple (polarity + P amp) input still accepted -> S/P defaults to zero
     bundle = (np.array([1., -1.]), np.array([0.5, 0.2]),
               np.array([1., 1.]), np.array([1., 1.]))
-    pol, pamp, wp, wa = m.get_observed(bundle)
+    pol, pamp, sprat, wp, wa, ws = m.get_observed(bundle)
     np.testing.assert_allclose(pol, [1., -1.])
     np.testing.assert_allclose(pamp, [0.5, 0.2])
     np.testing.assert_allclose(wp, [1., 1.])
     np.testing.assert_allclose(wa, [1., 1.])
+    np.testing.assert_allclose(sprat, [0., 0.])
+    np.testing.assert_allclose(ws, [0., 0.])
+
+
+def test_get_observed_6tuple_roundtrip():
+    m = PolarityRelPampMisfit(method='taup')
+    bundle = (np.array([1., -1.]), np.array([0.5, 0.2]), np.array([2.0, 3.0]),
+              np.array([1., 1.]), np.array([1., 1.]), np.array([1., 0.]))
+    pol, pamp, sprat, wp, wa, ws = m.get_observed(bundle)
+    np.testing.assert_allclose(sprat, [2.0, 3.0])
+    np.testing.assert_allclose(ws, [1., 0.])
 
 
 def test_get_observed_polarity_only_backward_compatible():
     m = PolarityRelPampMisfit(method='taup')
-    pol, pamp, wp, wa = m.get_observed([1, -1, 0])
+    pol, pamp, sprat, wp, wa, ws = m.get_observed([1, -1, 0])
     np.testing.assert_allclose(pol, [1., -1., 0.])
     np.testing.assert_allclose(wp, [1., 1., 0.])   # picked stations weight 1
     np.testing.assert_allclose(wa, [0., 0., 0.])   # no amplitude data
+    np.testing.assert_allclose(ws, [0., 0., 0.])   # no S/P data
 
 
 # ---------------------------------------------------------------------------
@@ -351,10 +402,13 @@ def test_ray_path_distance_mode_finite_positive():
 def test_count_observations():
     m = PolarityRelPampMisfit(method='taup')
     obs = (np.array([1., -1., 0.]), np.array([0.5, 0.2, 0.9]),
-           np.array([1., 1., 0.]), np.array([1., 0., 1.]))
+           np.array([2., 3., 4.]),
+           np.array([1., 1., 0.]), np.array([1., 0., 1.]),
+           np.array([1., 1., 0.]))
     c = m.count_observations(obs)
     assert c['pol'] == 2
     assert c['pamp'] == 2
+    assert c['sprat'] == 2
 
 
 def test_description_returns_str():
@@ -368,10 +422,96 @@ def test_public_import_paths():
     from mtuq.misfit import (
         PolarityRelPampMisfit as _A,
         relative_pamp_polarity_from_dict as _B,
+        relative_pol_pamp_spamp_from_dict as _C,
     )
     # re-exported at the top level
     import mtuq
     assert hasattr(mtuq, 'PolarityRelPampMisfit')
+
+
+def test_constructor_sprat_defaults_and_validation():
+    m = PolarityRelPampMisfit(method='taup')
+    assert m.lambda_sprat == 0.0
+    assert m.norm_sprat == 'L1'
+    assert m.sp_obs_is_log10 is False
+    with pytest.raises(ValueError):
+        PolarityRelPampMisfit(method='taup', norm_sprat='L9')
+
+
+def test_from_dict_spamp_aligns_and_weights():
+    stations = [_station('AAA'), _station('BBB')]
+    from mtuq.misfit.relative_amplitude import relative_pol_pamp_spamp_from_dict
+    pol = {'AAA': 1, 'BBB': -1}
+    pamp = {'AAA': 0.5, 'BBB': 0.2}
+    sprat = {'AAA': 2.0}                      # BBB absent -> 0 value, 0 weight
+    out = relative_pol_pamp_spamp_from_dict(
+        pol, pamp, sprat, None, None, None, stations)
+    pol_o, pamp_o, sprat_o, wp, wa, ws = out
+    np.testing.assert_allclose(sprat_o, [2.0, 0.0])
+    np.testing.assert_allclose(ws, [1.0, 0.0])
+
+
+def test_lambda_sprat_zero_ignores_sp_observations():
+    m = PolarityRelPampMisfit(method='taup')  # lambda_sprat == 0
+    greens = _make_greens([500., 1500., 3000.], [10., 120., 240.])
+    true = np.array([[1., -1., 0., 0.5, 0.2, -0.3]])
+    pol_t, amp_t = m.get_predicted(greens, true, return_all=True)
+    cand = np.array([[0.2, -1., 0.5, 0.1, 0.3, -0.4]])
+    e4 = m((pol_t[0], amp_t[0], np.ones(3), np.ones(3)), greens, cand)
+    # add garbage S/P with unit weight; must be ignored because lambda_sprat=0
+    e6 = m((pol_t[0], amp_t[0], np.array([9., 9., 9.]),
+            np.ones(3), np.ones(3), np.ones(3)), greens, cand)
+    np.testing.assert_allclose(e4, e6)
+
+
+def test_self_recovery_with_sprat_term():
+    m = PolarityRelPampMisfit(
+        method='taup', lambda_pol=1.0, lambda_pamp=1.0, lambda_sprat=1.0,
+        sp_obs_is_log10=True)
+    greens = _make_greens(
+        [500., 1500., 3000., 4500., 6000., 2500., 3500.],
+        [10., 60., 120., 180., 240., 300., 340.])
+    true = np.array([1., -1., 0.2, 0.5, 0.2, -0.3])
+    pol_t, pamp_t, sprat_t = m._predict(greens, true.reshape(1, 6))
+    n = len(greens)
+    obs = (pol_t[0], pamp_t[0], sprat_t[0],
+           np.ones(n), np.ones(n), np.ones(n))
+    candidates = np.array([
+        [2., 0., 1., 0., 0., 0.],
+        true,                             # index 1 == truth
+        [0., 0., 0., 1., 0., 0.],
+        [1., 0., -1., 0.2, -0.4, 0.1],
+    ])
+    e = m(obs, greens, candidates)
+    assert int(np.argmin(e[:, 0])) == 1
+    assert e[1, 0] < 1e-9
+
+
+def test_sp_obs_is_log10_flag_matches_linear_input():
+    greens = _make_greens([500., 1500., 3000., 4500.], [10., 100., 190., 280.])
+    true = np.array([[0.4, -1., 0.6, 0.3, -0.2, 0.1]])
+    base = PolarityRelPampMisfit(
+        method='taup', lambda_pol=0., lambda_pamp=0., lambda_sprat=1.,
+        sp_obs_is_log10=True)
+    _, _, sprat_t = base._predict(greens, true)
+    n = len(greens)
+    logobs = sprat_t[0]
+
+    m_log = base
+    m_lin = PolarityRelPampMisfit(
+        method='taup', lambda_pol=0., lambda_pamp=0., lambda_sprat=1.,
+        sp_obs_is_log10=False)
+    z = np.zeros(n)
+    obs_log = (z, z, logobs, z, z, np.ones(n))
+    obs_lin = (z, z, 10.0 ** logobs, z, z, np.ones(n))
+
+    cands = np.array([true[0],
+                      [1., 0., -1., 0.2, -0.4, 0.1],
+                      [0.2, -1., 0.5, 0.1, 0.3, -0.4]])
+    e_log = m_log(obs_log, greens, cands)
+    e_lin = m_lin(obs_lin, greens, cands)
+    np.testing.assert_allclose(e_log, e_lin, atol=1e-9)
+    assert e_log[0, 0] < 1e-9              # perfect fit at truth
 
 
 def test_collect_attributes_has_polarity_and_takeoff():
