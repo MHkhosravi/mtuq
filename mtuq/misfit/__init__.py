@@ -3,6 +3,11 @@ from mtuq.misfit.waveform import WaveformMisfit
 
 from mtuq.misfit.polarity import PolarityMisfit, polarities_from_dict
 
+from mtuq.misfit.relative_amplitude import (
+    PolarityRelPampMisfit,
+    relative_pamp_polarity_from_dict,
+)
+
 #
 # for backward compatibility
 #
