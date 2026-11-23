@@ -34,7 +34,7 @@ from mtuq.event import Origin
 from mtuq.graphics import (
     plot_beachball, plot_polarities, plot_misfit_dc, plot_misfit_lune)
 from mtuq.grid import Grid, DoubleCoupleGridRegular
-from mtuq.grid.moment_tensor import to_mt
+from mtuq.grid.moment_tensor import to_mt, _semiregular
 from mtuq.grid_search import grid_search
 from mtuq.misfit import PolarityRelPampMisfit
 from mtuq.util import fullpath
@@ -59,6 +59,9 @@ if __name__ == '__main__':
     #
     # The misfit: joint polarity + relative-P-amplitude, both L1 (paper default),
     # with per-station weights supplied through the observation bundle.
+    # Note: PolarityRelPampMisfit.paper_preset() can also be used to configure
+    # the misfit exactly as in the paper (lambda_pol=0.0, project_to_vertical=True,
+    # distance_mode='ray_path').
     #
     misfit = PolarityRelPampMisfit(
         method='taup',
@@ -124,8 +127,7 @@ if __name__ == '__main__':
     # Stage 2: fix the fault geometry, grid search the Lune (source type)
     #
     print('Stage 2: Lune grid search (source type, fault fixed)...\n')
-    v = open_interval(-1. / 3., 1. / 3., 40)
-    w = open_interval(-3. / 8. * np.pi, 3. / 8. * np.pi, 40)
+    v, w = _semiregular(40, 81, 0.8, 0.8)
     grid_lune = Grid(
         dims=('rho', 'v', 'w', 'kappa', 'sigma', 'h'),
         coords=(np.array([best_dict['rho']]), v, w,

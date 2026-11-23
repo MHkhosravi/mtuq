@@ -13,14 +13,25 @@ from types import SimpleNamespace
 
 from mtuq.misfit.relative_amplitude import (
     PolarityRelPampMisfit,
+    GeometryList,
     relative_pamp_polarity_from_dict,
     _use_to_ned,
     _pol_pamp_mt,
     _max_abs_normalize,
     _weighted_misfit_term,
+    _weighted_median_rows,
     _s_over_p_log10_mt,
     _medium_from_taup_at_depth,
+    _takeoff_incidence_taup,
+    _ray_path_lengths_m_taup,
 )
+from mtuq.event import Origin
+from mtuq.util import AttribDict
+from mtuq.grid.moment_tensor import DoubleCoupleGridRegular, _semiregular
+from mtuq.util.math import to_delta, to_gamma, to_mij
+from obspy.taup import TauPyModel
+from obspy.geodetics import kilometers2degrees
+from obspy.imaging.beachball import aux_plane
 
 
 def _station(name, network='XX'):
@@ -583,3 +594,493 @@ def test_end_to_end_fixed_fault_lune_grid_recovers_truth():
     assert e.shape[0] == lune.size
     assert np.all(np.isfinite(e))
     assert e[idx0, 0] < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# C6.1: GeometryList tests
+# ---------------------------------------------------------------------------
+
+def test_geometry_list_select_from_arrays_and_get_stations():
+    orig1 = Origin({'latitude': 54.0, 'longitude': -120.0, 'depth_in_m': 2500.0})
+    orig2 = Origin({'latitude': 54.0, 'longitude': -120.0, 'depth_in_m': 3500.0})
+    stations = [_station('STA1'), _station('STA2'), _station('STA3')]
+    az = [45., 135., 225.]
+    dist = [1000., 2000., 3000.]
+
+    # length validation
+    with pytest.raises(ValueError):
+        GeometryList.from_arrays(orig1, stations, [45.], dist)
+    with pytest.raises(ValueError):
+        GeometryList.from_arrays(orig1, stations, az, [1000.])
+    with pytest.raises(ValueError):
+        GeometryList.from_arrays(orig1, stations, az, dist, takeoff_angle=[100.])
+    with pytest.raises(ValueError):
+        GeometryList.from_arrays(orig1, stations, az, dist, incidence_angle=[10.])
+    with pytest.raises(ValueError):
+        GeometryList.from_arrays(orig1, stations, az, dist, ray_length_in_m=[1000.])
+    with pytest.raises(ValueError):
+        GeometryList.from_arrays(orig1, stations, az, dist, vp_over_vs=[1.7, 1.8])
+
+    # valid creation
+    gl = GeometryList.from_arrays(
+        orig1, stations, az, dist,
+        takeoff_angle=[150., 140., 130.],
+        incidence_angle=[30., 40., 50.],
+        ray_length_in_m=[1200., 2200., 3200.],
+        vp_over_vs=1.73)
+    assert len(gl) == 3
+
+    # get_stations order and fields
+    stas = gl.get_stations()
+    assert len(stas) == 3
+    assert [s.station for s in stas] == ['STA1', 'STA2', 'STA3']
+    assert [s.network for s in stas] == ['XX', 'XX', 'XX']
+
+    # append entry with orig2
+    entry4 = AttribDict({
+        'origin': orig2,
+        'station': AttribDict({'station': 'STA4', 'network': 'XX'}),
+        'azimuth': 315.,
+        'distance_in_m': 4000.,
+    })
+    gl.append(entry4)
+    assert len(gl) == 4
+
+    # select only entries matching orig1
+    sel1 = gl.select(orig1)
+    assert isinstance(sel1, GeometryList)
+    assert len(sel1) == 3
+    assert [e.station.station for e in sel1] == ['STA1', 'STA2', 'STA3']
+    assert all(e.origin == orig1 for e in sel1)
+
+    # select only entries matching orig2
+    sel2 = gl.select(orig2)
+    assert isinstance(sel2, GeometryList)
+    assert len(sel2) == 1
+    assert sel2[0].station.station == 'STA4'
+
+    # non-Origin selector raises TypeError
+    with pytest.raises(TypeError):
+        gl.select("not_an_origin")
+    with pytest.raises(TypeError):
+        gl.select(12345)
+    with pytest.raises(TypeError):
+        gl.select({'depth_in_m': 2500.0})
+
+
+# ---------------------------------------------------------------------------
+# C6.2: Precomputed method matches TauP
+# ---------------------------------------------------------------------------
+
+def test_precomputed_method_matches_taup():
+    orig = Origin({'latitude': 56.0, 'longitude': -122.0, 'depth_in_m': 2500.0})
+    greens = _make_greens([500., 1200., 2500., 4000.], [30., 110., 210., 315.], depth_m=2500.0)
+
+    m_taup = PolarityRelPampMisfit(
+        method='taup', taup_model='ak135',
+        lambda_pol=1.0, lambda_pamp=1.0, lambda_sprat=1.0,
+        project_to_vertical=True, distance_mode='ray_path')
+
+    takeoff, incidence = m_taup._takeoff_incidence(greens)
+    ray_len = m_taup._distances_m(greens)
+    vov = m_taup._vp_over_vs(greens)
+
+    geom_list = GeometryList.from_arrays(
+        orig, [g.station for g in greens],
+        [g.azimuth for g in greens], [g.distance_in_m for g in greens],
+        takeoff_angle=takeoff, incidence_angle=incidence,
+        ray_length_in_m=ray_len, vp_over_vs=vov)
+
+    m_pre = PolarityRelPampMisfit(
+        method='precomputed',
+        lambda_pol=1.0, lambda_pamp=1.0, lambda_sprat=1.0,
+        project_to_vertical=True, distance_mode='ray_path')
+    assert m_pre._taup is None
+
+    sources = np.array([
+        [1., -1., 0.2, 0.5, 0.2, -0.3],
+        [0.3, 0.4, -0.7, 0.1, -0.5, 0.2],
+        [-0.5, 0.2, 0.3, -0.2, 0.4, -0.1],
+    ])
+
+    pol_taup, pamp_taup, sp_taup = m_taup.get_predicted(greens, sources, return_sprat=True)
+    pol_pre, pamp_pre, sp_pre = m_pre.get_predicted(geom_list, sources, return_sprat=True)
+
+    np.testing.assert_allclose(pol_taup, pol_pre)
+    np.testing.assert_allclose(pamp_taup, pamp_pre, rtol=1e-12)
+    np.testing.assert_allclose(sp_taup, sp_pre, rtol=1e-12)
+
+    obs = (pol_taup[0], pamp_taup[0], sp_taup[0],
+           np.ones(4), np.ones(4), np.ones(4))
+    e_taup = m_taup(obs, greens, sources)
+    e_pre = m_pre(obs, geom_list, sources)
+    np.testing.assert_allclose(e_taup, e_pre, atol=1e-12)
+
+    terms_taup = m_taup.get_terms(obs, greens, sources)
+    terms_pre = m_pre.get_terms(obs, geom_list, sources)
+    for tt, tp in zip(terms_taup, terms_pre):
+        np.testing.assert_allclose(tt, tp, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# C6.3: Paper preset values and overrides
+# ---------------------------------------------------------------------------
+
+def test_paper_preset_defaults_and_overrides():
+    m = PolarityRelPampMisfit.paper_preset()
+    assert m.method == 'taup'
+    assert m.taup_model == 'ak135'
+    assert m.lambda_pol == 0.0
+    assert m.lambda_pamp == 1.0
+    assert m.lambda_sprat == 0.0
+    assert m.norm_pamp == 'L1'
+    assert m.project_to_vertical is True
+    assert m.distance_mode == 'ray_path'
+
+    m_ov = PolarityRelPampMisfit.paper_preset(
+        method='precomputed', lambda_sprat=1.0, sp_obs_is_log10=True,
+        norm_sprat='L2')
+    assert m_ov.method == 'precomputed'
+    assert m_ov.lambda_sprat == 1.0
+    assert m_ov.sp_obs_is_log10 is True
+    assert m_ov.norm_sprat == 'L2'
+    assert m_ov.lambda_pol == 0.0
+    assert m_ov.lambda_pamp == 1.0
+    assert m_ov.project_to_vertical is True
+    assert m_ov.distance_mode == 'ray_path'
+
+
+# ---------------------------------------------------------------------------
+# C6.4: TauP straight-ray relation in homogeneous crust
+# ---------------------------------------------------------------------------
+
+def test_taup_straight_ray_in_ak135_homogeneous_crust():
+    model = TauPyModel('ak135')
+    depth_km = 2.5
+    for d_km in [0.3, 1.0, 2.0, 4.0]:
+        d_deg = kilometers2degrees(d_km)
+        arrs = model.get_travel_times(depth_km, d_deg, phase_list=['p', 'P'])
+        arr = sorted(arrs, key=lambda a: a.time)[0]
+
+        expected_inc = np.degrees(np.arctan2(d_km, depth_km))
+        expected_to = 180.0 - expected_inc
+
+        # Check empirical takeoff and incidence against straight ray
+        assert abs(arr.takeoff_angle - expected_to) < 0.1
+        assert abs(arr.incident_angle - expected_inc) < 0.1
+
+        # Check ray path length against hypocentral distance
+        g = [SimpleNamespace(
+            origin=SimpleNamespace(depth_in_m=depth_km * 1000.0),
+            station=SimpleNamespace(station='S', network='XX'),
+            azimuth=0.0,
+            distance_in_m=d_km * 1000.0,
+        )]
+        rl = _ray_path_lengths_m_taup(model, g)[0]
+        hyp = np.sqrt((d_km * 1000.0) ** 2 + (depth_km * 1000.0) ** 2)
+        assert abs(rl - hyp) / hyp < 0.005
+
+
+# ---------------------------------------------------------------------------
+# C6.5: project_to_vertical factor equals x3/r under straight rays
+# ---------------------------------------------------------------------------
+
+def test_project_to_vertical_factor_equals_x3_over_r():
+    depth_m = 2500.0
+    distances = np.array([300., 1000., 2000., 4000.])
+    azimuths = np.array([0., 90., 180., 270.])
+
+    inc = np.degrees(np.arctan2(distances, depth_m))
+    to = 180.0 - inc
+    hyp = np.sqrt(distances ** 2 + depth_m ** 2)
+
+    orig = Origin({'latitude': 0., 'longitude': 0., 'depth_in_m': depth_m})
+    stations = [_station('S%d' % i) for i in range(len(distances))]
+
+    geom = GeometryList.from_arrays(
+        orig, stations, azimuths, distances,
+        takeoff_angle=to, incidence_angle=inc,
+        ray_length_in_m=hyp, vp_over_vs=1.73)
+
+    m_vert = PolarityRelPampMisfit(method='precomputed', project_to_vertical=True)
+    m_slant = PolarityRelPampMisfit(method='precomputed', project_to_vertical=False)
+
+    mt = np.array([[1., -1., 0.2, 0.5, 0.2, -0.3]])
+    _, pamp_vert = m_vert.get_predicted(geom, mt, return_all=True)
+    _, pamp_slant = m_slant.get_predicted(geom, mt, return_all=True)
+
+    ratio = pamp_vert / pamp_slant
+    expected_factor = depth_m / hyp
+    np.testing.assert_allclose(ratio[0], expected_factor, rtol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# C6.6: sprat_offset='fit' and weighted median helper
+# ---------------------------------------------------------------------------
+
+def test_weighted_median_rows_random_reference():
+    def brute_force_weighted_median(values, weights):
+        idx = np.argsort(values)
+        s_vals = values[idx]
+        s_w = weights[idx]
+        cum_w = np.cumsum(s_w)
+        tot_w = np.sum(s_w)
+        k = np.where(cum_w >= 0.5 * tot_w)[0][0]
+        return s_vals[k]
+
+    np.random.seed(123)
+    n_rows, n_cols = 25, 40
+    val = np.random.randn(n_rows, n_cols)
+    w = np.random.uniform(0.1, 5.0, n_cols)
+
+    vec_medians = _weighted_median_rows(val, w)
+    bf_medians = np.array([brute_force_weighted_median(val[i], w) for i in range(n_rows)])
+    np.testing.assert_allclose(vec_medians, bf_medians)
+
+
+def test_sprat_offset_fit_invariance_and_norms():
+    greens = _make_greens([1000., 2000., 3000.], [30., 120., 240.])
+    sources = np.array([
+        [1., -1., 0., 0.5, 0.2, -0.3],
+        [0.2, 0.4, -0.6, 0.1, -0.2, 0.3],
+    ])
+    weights = np.array([1., 2., 3.])
+
+    # L1 norm test
+    m_l1 = PolarityRelPampMisfit(
+        method='taup', lambda_pol=0.0, lambda_pamp=0.0, lambda_sprat=1.0,
+        norm_sprat='L1', sp_obs_is_log10=True, sprat_offset='fit')
+
+    _, _, sp_syn = m_l1.get_predicted(greens, sources, return_sprat=True)
+    obs_sp = sp_syn[0] + 0.4
+    obs1 = (np.zeros(3), np.zeros(3), obs_sp,
+            np.zeros(3), np.zeros(3), weights)
+    obs2 = (np.zeros(3), np.zeros(3), obs_sp + 4.8,
+            np.zeros(3), np.zeros(3), weights)
+
+    e_l1_1 = m_l1(obs1, greens, sources)
+    e_l1_2 = m_l1(obs2, greens, sources)
+    np.testing.assert_allclose(e_l1_1, e_l1_2, atol=1e-12)
+
+    # L2 norm test
+    m_l2 = PolarityRelPampMisfit(
+        method='taup', lambda_pol=0.0, lambda_pamp=0.0, lambda_sprat=1.0,
+        norm_sprat='L2', sp_obs_is_log10=True, sprat_offset='fit')
+
+    e_l2_1 = m_l2(obs1, greens, sources)
+    e_l2_2 = m_l2(obs2, greens, sources)
+    np.testing.assert_allclose(e_l2_1, e_l2_2, atol=1e-12)
+
+    # Verify L2 uses weighted mean
+    diff = obs_sp[None, :] - sp_syn
+    c_expected = np.sum(diff * weights[None, :], axis=1) / np.sum(weights)
+    res = sp_syn + c_expected[:, None] - obs_sp[None, :]
+    expected_l2 = np.sum(weights[None, :] * res ** 2, axis=1) / np.sum(weights)
+    np.testing.assert_allclose(e_l2_1[:, 0], expected_l2, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# C6.7: sprat_max_incidence excludes high-incidence stations
+# ---------------------------------------------------------------------------
+
+def test_sprat_max_incidence_excludes_high_incidence():
+    orig = Origin({'latitude': 50., 'longitude': -120., 'depth_in_m': 2500.})
+    geom = GeometryList.from_arrays(
+        orig, [_station('S1'), _station('S2'), _station('S3')],
+        [10., 100., 200.], [1000., 2000., 3000.],
+        takeoff_angle=[165., 150., 125.],
+        incidence_angle=[15., 30., 55.],
+        ray_length_in_m=[1200., 2200., 3500.],
+        vp_over_vs=1.73)
+
+    m_filt = PolarityRelPampMisfit(
+        method='precomputed', lambda_pol=1.0, lambda_pamp=1.0, lambda_sprat=1.0,
+        sp_obs_is_log10=True, sprat_max_incidence=35.0)
+
+    obs_sp_clean = np.array([0.5, 0.8, 1.2])
+    obs_sp_dirty = np.array([0.5, 0.8, 999.0])  # extreme value at station 3 (inc 55 > 35)
+
+    data_clean = (np.array([1., 1., 1.]), np.array([0.5, 0.3, 0.2]),
+                  obs_sp_clean, np.ones(3), np.ones(3), np.ones(3))
+    data_dirty = (np.array([1., 1., 1.]), np.array([0.5, 0.3, 0.2]),
+                  obs_sp_dirty, np.ones(3), np.ones(3), np.ones(3))
+
+    sources = np.array([[1., -1., 0., 0.5, 0.2, -0.3]])
+
+    t_clean = m_filt.get_terms(data_clean, geom, sources)
+    t_dirty = m_filt.get_terms(data_dirty, geom, sources)
+    # S/P term must be completely unaffected by station 3
+    np.testing.assert_allclose(t_clean[2], t_dirty[2], atol=1e-12)
+
+    # Without filter, station 3 blows up the misfit
+    m_nofilt = PolarityRelPampMisfit(
+        method='precomputed', lambda_pol=1.0, lambda_pamp=1.0, lambda_sprat=1.0,
+        sp_obs_is_log10=True, sprat_max_incidence=None)
+    t_nofilt = m_nofilt.get_terms(data_dirty, geom, sources)
+    assert t_nofilt[2][0] > 100.0
+
+    # Polarity and P-amplitude at station 3 are NOT excluded
+    data_pol_flipped = (np.array([1., 1., -1.]), np.array([0.5, 0.3, 0.2]),
+                        obs_sp_clean, np.ones(3), np.ones(3), np.ones(3))
+    t_pol = m_filt.get_terms(data_pol_flipped, geom, sources)
+    assert t_pol[0][0] != t_clean[0][0]
+
+
+# ---------------------------------------------------------------------------
+# C6.8: Ding published nodes in grids
+# ---------------------------------------------------------------------------
+
+def test_ding_published_nodes_in_grids():
+    ding_gammas = [-3.55, -2.13, -9.25, -10.68, -7.82, -12.12, -16.5]
+    ding_colats = [88.04, 90.0, 93.9, 91.9, 88.0, 82.2]
+
+    v_grid, w_grid = _semiregular(40, 81, 0.8, 0.8)
+    gamma_grid = to_gamma(v_grid)
+    colat_grid = 90.0 - to_delta(w_grid)
+
+    for g in ding_gammas:
+        diff = np.min(np.abs(gamma_grid - g))
+        assert diff < 0.1, "gamma=%f not within 0.1 deg of grid" % g
+
+    for c in ding_colats:
+        diff = np.min(np.abs(colat_grid - c))
+        assert diff < 0.1, "colatitude=%f not within 0.1 deg of grid" % c
+
+    grid_dc = DoubleCoupleGridRegular(npts_per_axis=40)
+    k_idx = grid_dc.dims.index('kappa')
+    s_idx = grid_dc.dims.index('sigma')
+    h_idx = grid_dc.dims.index('h')
+
+    # Ding DC: strike=139.5, dip=24.1, rake=78.75
+    diff_k = np.min(np.abs(grid_dc.coords[k_idx] - 139.5))
+    diff_s = np.min(np.abs(grid_dc.coords[s_idx] - 78.75))
+    dips = np.degrees(np.arccos(grid_dc.coords[h_idx]))
+    diff_dip = np.min(np.abs(dips - 24.1))
+
+    assert diff_k < 1e-6
+    assert diff_s < 1e-6
+    assert diff_dip < 0.1
+
+
+# ---------------------------------------------------------------------------
+# C6.9: DC nodal planes produce identical moment tensor
+# ---------------------------------------------------------------------------
+
+def test_both_dc_nodal_planes_produce_same_moment_tensor():
+    s1, d1, r1 = 143.4, 30.9, 93.8
+    s2, d2, r2 = aux_plane(s1, d1, r1)
+
+    mt1 = to_mij(1.0, 0.0, 0.0, s1, r1, np.cos(np.deg2rad(d1)))
+    mt2 = to_mij(1.0, 0.0, 0.0, s2, r2, np.cos(np.deg2rad(d2)))
+
+    np.testing.assert_allclose(mt1, mt2, rtol=1e-6, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# C6.10: ding_error formula and scaling
+# ---------------------------------------------------------------------------
+
+def test_ding_error_formula_and_scaling():
+    m = PolarityRelPampMisfit(method='taup', lambda_pamp=1.0)
+    greens = _make_greens([1000., 2000., 3000., 4000.], [30., 120., 210., 300.])
+    true_mt = np.array([[1., -1., 0.2, 0.5, 0.2, -0.3]])
+    cand_mt = np.array([
+        [0.5, 0.2, -0.7, 0.1, -0.3, 0.4],
+        true_mt[0],
+    ])
+
+    pol_t, amp_t = m.get_predicted(greens, true_mt, return_all=True)
+    w_unit = np.ones(4)
+    obs_unit = (pol_t[0], amp_t[0], w_unit, w_unit)
+
+    err_unit = m.ding_error(obs_unit, greens, cand_mt)
+    # At true MT, ding_error is 0
+    assert err_unit[1] < 1e-12
+
+    # For candidate 0, verify formula 0.5 * sum |Pobs_n - Pcalc_n|
+    _, pth_all = m.get_predicted(greens, cand_mt, return_all=True)
+    pobs_n = _max_abs_normalize(amp_t[0], np.ones(4, dtype=bool))
+    pth_n = _max_abs_normalize(pth_all[0], np.ones(4, dtype=bool))
+    expected_e0 = 0.5 * np.sum(np.abs(pobs_n - pth_n))
+    np.testing.assert_allclose(err_unit[0], expected_e0, atol=1e-12)
+
+    # Scaling weights by 2.5 scales ding_error by 2.5
+    w_scaled = 2.5 * np.ones(4)
+    obs_scaled = (pol_t[0], amp_t[0], w_unit, w_scaled)
+    err_scaled = m.ding_error(obs_scaled, greens, cand_mt)
+    np.testing.assert_allclose(err_scaled, 2.5 * err_unit, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: validation and return_sprat
+# ---------------------------------------------------------------------------
+
+def test_sprat_arg_validation():
+    with pytest.raises(ValueError):
+        PolarityRelPampMisfit(sprat_offset='unrecognized')
+    with pytest.raises(ValueError):
+        PolarityRelPampMisfit(sprat_offset=True)
+
+    with pytest.raises(ValueError):
+        PolarityRelPampMisfit(sprat_max_incidence=-10.0)
+    with pytest.raises(ValueError):
+        PolarityRelPampMisfit(sprat_max_incidence='bad')
+    with pytest.raises(ValueError):
+        PolarityRelPampMisfit(sprat_max_incidence=False)
+
+
+def test_get_predicted_return_sprat_when_lambda_sprat_zero():
+    m = PolarityRelPampMisfit(method='taup', lambda_sprat=0.0)
+    greens = _make_greens([1000., 2000.], [45., 135.])
+    sources = np.array([[1., -1., 0., 0.5, 0.2, -0.3]])
+
+    # return_sprat=False (default) returns pol
+    pol = m.get_predicted(greens, sources)
+    assert isinstance(pol, np.ndarray) and pol.shape == (1, 2)
+
+    # return_all=True returns (pol, pamp)
+    pol, pamp = m.get_predicted(greens, sources, return_all=True)
+    assert pol.shape == (1, 2) and pamp.shape == (1, 2)
+
+    # return_sprat=True returns (pol, pamp, sprat) with sprat computed
+    pol, pamp, sprat = m.get_predicted(greens, sources, return_sprat=True)
+    assert pol.shape == (1, 2) and pamp.shape == (1, 2)
+    assert sprat is not None and sprat.shape == (1, 2)
+    assert np.all(np.isfinite(sprat))
+
+
+def test_precomputed_missing_attributes_raise_value_error():
+    orig = Origin({'latitude': 50., 'longitude': -120., 'depth_in_m': 2500.})
+    m = PolarityRelPampMisfit(method='precomputed', distance_mode='ray_path')
+
+    # Missing takeoff
+    g_no_to = [AttribDict({'origin': orig, 'station': _station('S1'),
+                           'azimuth': 0., 'distance_in_m': 1000.,
+                           'incidence_angle': 20., 'ray_length_in_m': 1200.,
+                           'vp_over_vs': 1.73})]
+    with pytest.raises(ValueError, match="takeoff_angle"):
+        m._takeoff_incidence(g_no_to)
+
+    # Missing incidence
+    g_no_inc = [AttribDict({'origin': orig, 'station': _station('S1'),
+                            'azimuth': 0., 'distance_in_m': 1000.,
+                            'takeoff_angle': 160., 'ray_length_in_m': 1200.,
+                            'vp_over_vs': 1.73})]
+    with pytest.raises(ValueError, match="incidence_angle"):
+        m._takeoff_incidence(g_no_inc)
+
+    # Missing ray_length_in_m
+    g_no_rl = [AttribDict({'origin': orig, 'station': _station('S1'),
+                           'azimuth': 0., 'distance_in_m': 1000.,
+                           'takeoff_angle': 160., 'incidence_angle': 20.,
+                           'vp_over_vs': 1.73})]
+    with pytest.raises(ValueError, match="ray_length_in_m"):
+        m._distances_m(g_no_rl)
+
+    # Missing vp_over_vs
+    g_no_vov = [AttribDict({'origin': orig, 'station': _station('S1'),
+                            'azimuth': 0., 'distance_in_m': 1000.,
+                            'takeoff_angle': 160., 'incidence_angle': 20.,
+                            'ray_length_in_m': 1200.})]
+    with pytest.raises(ValueError, match="vp_over_vs"):
+        m._vp_over_vs(g_no_vov)

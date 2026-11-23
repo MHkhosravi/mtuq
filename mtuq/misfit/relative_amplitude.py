@@ -10,9 +10,8 @@ normalized by the maximum absolute value across sensors (separately for observed
 and synthetic), which cancels a common instrument response and leaves a
 scale-free amplitude pattern that constrains fault geometry and source type.
 
-This is a fresh, dedicated implementation for polarity + relative-P-amplitude.
-An S/P amplitude-ratio term is intentionally NOT implemented yet; hooks are noted
-where SV/SH radiation and an ``lambda_sprat`` term would slot in later.
+This module provides PolarityRelPampMisfit supporting polarity, relative P-wave
+amplitude, and an optional S/P amplitude-ratio constraint.
 """
 
 import numpy as np
@@ -25,11 +24,137 @@ from obspy.taup import TauPyModel
 from obspy.geodetics import locations2degrees
 
 
-_ALLOWED_METHODS = ('taup', 'FK_metadata', 'CPS_metadata')
+_ALLOWED_METHODS = ('taup', 'precomputed', 'FK_metadata', 'CPS_metadata')
+
+
+class GeometryList(list):
+    """ Container for station geometry without Green's function waveforms.
+
+    Holds per-station geometry entries (each an :class:`mtuq.util.AttribDict`)
+    with keys:
+        - origin: an :class:`mtuq.event.Origin`
+        - station: an :class:`mtuq.util.AttribDict` (network, station, location,
+          latitude, longitude, elevation_in_m)
+        - azimuth: float, degrees (source -> station)
+        - distance_in_m: float, epicentral distance
+        - takeoff_angle: (optional) float, deg from downward vertical at source (>90 for up-going)
+        - incidence_angle: (optional) float, deg from vertical at receiver
+        - ray_length_in_m: (optional) float, geometric ray-path length
+        - vp_over_vs: (optional) float, Vp/Vs ratio
+    """
+
+    def __init__(self, entries=()):
+        super(GeometryList, self).__init__(entries)
+
+    def select(self, selector):
+        """ Selects geometry entries that match the given Origin. """
+        if not isinstance(selector, mtuq.Origin):
+            raise TypeError("Bad selector: %s" % type(selector).__name__)
+        selected = self.__class__([entry for entry in self if entry.origin == selector])
+        if len(selected) == 0 and len(self) > 0:
+            import warnings
+            warnings.warn("Nothing found matching given selector (%s)\n"
+                          % type(selector).__name__)
+        return selected
+
+    def get_stations(self):
+        """ List of station AttribDicts in order. """
+        return [entry.station for entry in self]
+
+    @classmethod
+    def from_arrays(cls, origin, stations, azimuth, distance_in_m,
+                    takeoff_angle=None, incidence_angle=None,
+                    ray_length_in_m=None, vp_over_vs=None):
+        """ Constructs a GeometryList from coordinate and parameter arrays. """
+        n = len(stations)
+        az = np.asarray(azimuth, dtype=np.float64)
+        dist = np.asarray(distance_in_m, dtype=np.float64)
+        if az.size != n:
+            raise ValueError("Length mismatch: len(stations)=%d, len(azimuth)=%d"
+                             % (n, az.size))
+        if dist.size != n:
+            raise ValueError("Length mismatch: len(stations)=%d, len(distance_in_m)=%d"
+                             % (n, dist.size))
+
+        to_arr = None
+        if takeoff_angle is not None:
+            to_arr = np.asarray(takeoff_angle, dtype=np.float64)
+            if to_arr.size != n:
+                raise ValueError("Length mismatch: len(stations)=%d, len(takeoff_angle)=%d"
+                                 % (n, to_arr.size))
+
+        inc_arr = None
+        if incidence_angle is not None:
+            inc_arr = np.asarray(incidence_angle, dtype=np.float64)
+            if inc_arr.size != n:
+                raise ValueError("Length mismatch: len(stations)=%d, len(incidence_angle)=%d"
+                                 % (n, inc_arr.size))
+
+        rl_arr = None
+        if ray_length_in_m is not None:
+            rl_arr = np.asarray(ray_length_in_m, dtype=np.float64)
+            if rl_arr.size != n:
+                raise ValueError("Length mismatch: len(stations)=%d, len(ray_length_in_m)=%d"
+                                 % (n, rl_arr.size))
+
+        vov_arr = None
+        if vp_over_vs is not None:
+            v_raw = np.asarray(vp_over_vs, dtype=np.float64)
+            if v_raw.ndim == 0 or v_raw.size == 1:
+                vov_arr = np.full(n, float(v_raw.ravel()[0]))
+            elif v_raw.size == n:
+                vov_arr = v_raw.ravel()
+            else:
+                raise ValueError("Length mismatch: len(stations)=%d, len(vp_over_vs)=%d"
+                                 % (n, v_raw.size))
+
+        entries = []
+        for i in range(n):
+            s = stations[i]
+            if isinstance(s, AttribDict):
+                sta_attr = s.copy()
+            elif isinstance(s, dict):
+                sta_attr = AttribDict(s)
+            else:
+                sta_attr = AttribDict()
+                for key in ('network', 'station', 'location', 'latitude', 'longitude', 'elevation_in_m'):
+                    if hasattr(s, key):
+                        sta_attr[key] = getattr(s, key)
+
+            defaults = {
+                'network': '',
+                'station': '',
+                'location': '',
+                'latitude': None,
+                'longitude': None,
+                'elevation_in_m': None,
+            }
+            for k, v in defaults.items():
+                if k not in sta_attr:
+                    sta_attr[k] = v
+
+            entry = AttribDict({
+                'origin': origin,
+                'station': sta_attr,
+                'azimuth': float(az.ravel()[i]),
+                'distance_in_m': float(dist.ravel()[i]),
+            })
+            if to_arr is not None:
+                entry.takeoff_angle = float(to_arr.ravel()[i])
+            if inc_arr is not None:
+                entry.incidence_angle = float(inc_arr.ravel()[i])
+            if rl_arr is not None:
+                entry.ray_length_in_m = float(rl_arr.ravel()[i])
+            if vov_arr is not None:
+                entry.vp_over_vs = float(vov_arr[i])
+
+            entries.append(entry)
+
+        return cls(entries)
 
 
 class PolarityRelPampMisfit(object):
-    """ Joint misfit for P-wave polarity and relative P-wave amplitude.
+    """ Joint misfit for P-wave polarity, relative P-wave amplitude, and S/P ratio.
 
     .. rubric:: Usage
 
@@ -38,14 +163,20 @@ class PolarityRelPampMisfit(object):
         misfit = PolarityRelPampMisfit(**parameters)
         values = misfit(data, greens, sources)     # -> (len(sources), 1)
 
-    ``data`` is an observation bundle ``(pol_obs, pamp_obs, w_pol, w_pamp)`` of
-    equal-length arrays (see :func:`relative_pamp_polarity_from_dict`), or a plain
-    polarity array/list for backward-compatible polarity-only use.
+    ``data`` is an observation bundle ``(pol_obs, pamp_obs, w_pol, w_pamp)`` or
+    ``(pol_obs, pamp_obs, sprat_obs, w_pol, w_pamp, w_sprat)`` of equal-length arrays
+    (see :func:`relative_pamp_polarity_from_dict` and
+    :func:`relative_pol_pamp_spamp_from_dict`), or a plain polarity array/list for
+    backward-compatible polarity-only use.
+
+    ``greens`` is a :class:`~mtuq.greens_tensor.GreensTensorList` or
+    :class:`~mtuq.misfit.relative_amplitude.GeometryList`.
 
     .. rubric:: Parameters
 
-    ``method`` (`str`): ``'taup'`` (default), ``'FK_metadata'``, ``'CPS_metadata'``.
-    Only ``'taup'`` is implemented.
+    ``method`` (`str`): ``'taup'`` (default), ``'precomputed'``, ``'FK_metadata'``,
+    ``'CPS_metadata'``. For ``'precomputed'``, takeoff angle, incidence angle, and
+    optionally ray length and Vp/Vs are read directly from geometry entries.
 
     ``taup_model`` (`str`): ObsPy TauP model name or path (default ``'ak135'``).
 
@@ -53,20 +184,39 @@ class PolarityRelPampMisfit(object):
 
     ``lambda_pamp`` (`float`): weight of the relative-P-amplitude term (default 1.0).
 
-    ``norm_pol`` / ``norm_pamp`` (`str`): ``'L1'`` (default, paper) or ``'L2'``.
+    ``lambda_sprat`` (`float`): weight of the S/P amplitude ratio term (default 0.0).
+
+    ``norm_pol`` / ``norm_pamp`` / ``norm_sprat`` (`str`): ``'L1'`` (default, paper) or ``'L2'``.
 
     ``project_to_vertical`` (`bool`): if True, multiply the predicted P amplitude
-    by ``cos(incidence angle at receiver)`` from the TauP model so the synthetic is
-    the true vertical component. Default False (scalar along-ray amplitude, matching
-    the sibling implementation; the constant ``1/(4 pi rho alpha**3)`` cancels under
+    by ``cos(incidence angle at receiver)`` so the synthetic is the true vertical
+    component. Default False (scalar along-ray amplitude, matching the sibling
+    implementation; the constant ``1/(4 pi rho alpha**3)`` cancels under
     max-abs normalization).
 
     ``distance_mode`` (`str`): ``'epicenter'`` (default) or ``'ray_path'`` for the
     ``1/r`` geometric-spreading factor.
 
-    ``rho`` / ``vp`` (`float` or `None`): optional medium override; otherwise taken
-    from the TauP model at source depth. Only affects a constant prefactor, which
-    cancels under normalization.
+    ``sp_obs_is_log10`` (`bool`): if True, observed S/P ratios are already in log10
+    space; if False (default), log10 is applied to positive observations.
+
+    ``sprat_offset`` (`None`, `'fit'`, or `float`): baseline offset for log10(S/P).
+    If float `c`, `+c` is added to predicted log10(S/P). If ``'fit'``, per-source
+    optimal offset is fitted (weighted median for L1, weighted mean for L2) to
+    minimize the residual. Default None.
+
+    ``sprat_max_incidence`` (`float` or `None`): if set (degrees), stations whose
+    receiver incidence angle exceeds this value are excluded from the S/P term only.
+    Default None.
+
+    ``rho`` / ``vp`` / ``vs`` (`float` or `None`): optional medium override;
+    otherwise taken from the TauP model at source depth or precomputed geometry.
+
+    .. rubric:: Presets and Methods
+
+    :meth:`paper_preset`: Classmethod returning an instance configured like
+    Ding et al. (2026).
+    :meth:`ding_error`: Computes Ding et al. (2026) Eq. 6 misfit values per source.
 
     .. note::
 
@@ -86,6 +236,8 @@ class PolarityRelPampMisfit(object):
         project_to_vertical=False,
         distance_mode='epicenter',
         sp_obs_is_log10=False,
+        sprat_offset=None,
+        sprat_max_incidence=None,
         rho=None,
         vp=None,
         vs=None,
@@ -106,6 +258,25 @@ class PolarityRelPampMisfit(object):
             raise TypeError('Bad parameter: method=%r' % method)
         self.method = method
 
+        if sprat_offset is not None and sprat_offset != 'fit':
+            if isinstance(sprat_offset, bool) or not isinstance(sprat_offset, (int, float)):
+                raise ValueError(
+                    "sprat_offset must be None, 'fit', or a float; got %r" % (sprat_offset,))
+            self.sprat_offset = float(sprat_offset)
+        else:
+            self.sprat_offset = sprat_offset
+
+        if sprat_max_incidence is not None:
+            if (isinstance(sprat_max_incidence, bool) or
+                    not isinstance(sprat_max_incidence, (int, float)) or
+                    sprat_max_incidence < 0):
+                raise ValueError(
+                    "sprat_max_incidence must be None or a non-negative float (degrees); got %r"
+                    % (sprat_max_incidence,))
+            self.sprat_max_incidence = float(sprat_max_incidence)
+        else:
+            self.sprat_max_incidence = None
+
         self.taup_model = taup_model
         self.lambda_pol = float(lambda_pol)
         self.lambda_pamp = float(lambda_pamp)
@@ -120,8 +291,57 @@ class PolarityRelPampMisfit(object):
             assert self.taup_model is not None
             self._taup = TauPyModel(self.taup_model)
         else:
-            # FK_metadata / CPS_metadata: geometry sources not implemented yet
+            # precomputed / FK_metadata / CPS_metadata
             self._taup = None
+
+    @classmethod
+    def paper_preset(cls, **overrides):
+        """ Returns an instance configured like Ding et al. (2026).
+
+        Default configuration:
+            method='taup', taup_model='ak135',
+            lambda_pol=0.0, lambda_pamp=1.0, lambda_sprat=0.0,
+            norm_pamp='L1', project_to_vertical=True,
+            distance_mode='ray_path'
+
+        Any keyword argument in ``overrides`` replaces the default.
+        """
+        defaults = dict(
+            method='taup',
+            taup_model='ak135',
+            lambda_pol=0.0,
+            lambda_pamp=1.0,
+            lambda_sprat=0.0,
+            norm_pamp='L1',
+            project_to_vertical=True,
+            distance_mode='ray_path',
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    def ding_error(self, data, greens, sources):
+        """ Ding et al. (2026) Eq. 6 misfit value per source.
+
+        Returns array of shape (n_mt,):
+            e = 0.5 * sum_{l in valid} w_l * |Pobs_l - Pcalc_l|
+        where Pobs and Pcalc are max-abs normalized over valid stations.
+        Not divided by sum of weights.
+        """
+        _, pamp_obs, _, _, w_pamp, _ = self.get_observed(data)
+        _, pamp_theo, _ = self._predict(greens, sources)
+        n_mt = pamp_theo.shape[0]
+
+        vamp = _observed_mask(pamp_obs, w_pamp, require_nonzero=False)
+        if not np.any(vamp):
+            return np.zeros(n_mt, dtype=np.float64)
+
+        pobs_n = _max_abs_normalize(pamp_obs, vamp)
+        pth_n = _max_abs_normalize(pamp_theo, vamp)
+
+        residual = np.abs(pth_n[:, vamp] - pobs_n[vamp][None, :])
+        w = w_pamp[vamp]
+        e = 0.5 * np.sum(w[None, :] * residual, axis=1)
+        return e
 
     def get_observed(self, data):
         """ Extract observations as ``(pol, pamp, sprat, w_pol, w_pamp, w_sprat)``.
@@ -150,13 +370,14 @@ class PolarityRelPampMisfit(object):
         z = np.zeros(n, dtype=np.float64)
         return pol_obs, z.copy(), z.copy(), w_pol, z.copy(), z.copy()
 
-    def _predict(self, greens, sources):
+    def _predict(self, greens, sources, force_sprat=False):
         """ Predicted (pol_theo, pamp_theo, sprat_theo) for each source/station.
 
-        ``sprat_theo`` (log10 S/P) is computed only when ``lambda_sprat != 0``;
-        otherwise it is ``None``. P amplitude includes ``1/r`` spreading and,
-        if ``project_to_vertical``, a ``cos(incidence)`` factor. The constant
-        ``1/(4 pi rho alpha**3)`` is omitted (it cancels under normalization).
+        ``sprat_theo`` (log10 S/P) is computed when ``lambda_sprat != 0`` or
+        ``force_sprat=True``; otherwise it is ``None``. P amplitude includes
+        ``1/r`` spreading and, if ``project_to_vertical``, a ``cos(incidence)``
+        factor. The constant ``1/(4 pi rho alpha**3)`` is omitted (it cancels
+        under normalization).
         """
         mt = self._sources_to_use_array(sources)
 
@@ -172,19 +393,40 @@ class PolarityRelPampMisfit(object):
             spreading=spreading, vertical_cos=vertical_cos)
 
         sprat_theo = None
-        if self.lambda_sprat != 0.0:
+        if self.lambda_sprat != 0.0 or force_sprat:
             sprat_theo = _s_over_p_log10_mt(
                 mt, takeoff, azimuth, self._vp_over_vs(greens))
+            if isinstance(self.sprat_offset, (int, float)) and not isinstance(self.sprat_offset, bool):
+                sprat_theo = sprat_theo + float(self.sprat_offset)
 
         return pol_theo, pamp_theo, sprat_theo
 
-    def get_predicted(self, greens, sources, return_all=False):
-        """ Predicted P polarity (and amplitude) for each source and station.
+    def get_predicted(self, greens, sources, return_all=False, return_sprat=False):
+        """ Predicted P polarity (and amplitude, S/P ratio) for each source and station.
 
-        Returns ``pol_theo`` by default, or ``(pol_theo, pamp_theo)`` when
-        ``return_all=True``.
+        Parameters
+        ----------
+        greens : GreensTensorList or GeometryList
+        sources : MomentTensor, Grid, or array-like
+        return_all : bool
+            If True and ``return_sprat=False``, returns ``(pol_theo, pamp_theo)``.
+        return_sprat : bool
+            If True, returns ``(pol_theo, pamp_theo, sprat_theo)`` with S/P ratio
+            computed even when ``lambda_sprat == 0``.
+
+        Returns
+        -------
+        pol_theo : array (n_mt, n_sta)
+            If ``return_all=False`` and ``return_sprat=False`` (default).
+        (pol_theo, pamp_theo) : tuple of arrays
+            If ``return_all=True`` and ``return_sprat=False``.
+        (pol_theo, pamp_theo, sprat_theo) : tuple of arrays
+            If ``return_sprat=True``.
         """
-        pol_theo, pamp_theo, _ = self._predict(greens, sources)
+        pol_theo, pamp_theo, sprat_theo = self._predict(
+            greens, sources, force_sprat=return_sprat)
+        if return_sprat:
+            return pol_theo, pamp_theo, sprat_theo
         if return_all:
             return pol_theo, pamp_theo
         return pol_theo
@@ -217,7 +459,7 @@ class PolarityRelPampMisfit(object):
             phi_pamp = np.zeros(n_mt, dtype=np.float64)
 
         if self.lambda_sprat != 0.0:
-            # S/P is compared absolutely in log10 space (already per-station
+            # S/P is compared in log10 space (already per-station
             # instrument- and spreading-independent; no cross-sensor norm)
             if self.sp_obs_is_log10:
                 vsp = _observed_mask(sprat_obs, w_sprat)
@@ -226,9 +468,27 @@ class PolarityRelPampMisfit(object):
                 vsp = _observed_mask(sprat_obs, w_sprat, require_positive=True)
                 obs_log = np.log10(np.maximum(
                     sprat_obs, np.finfo(np.float64).tiny))
-            phi_sprat = _weighted_misfit_term(
-                obs_log[vsp], sprat_theo[:, vsp], w_sprat[vsp],
-                norm=self.norm_sprat)
+
+            if self.sprat_max_incidence is not None:
+                _, incidence = self._takeoff_incidence(greens)
+                vsp = vsp & (np.asarray(incidence) <= float(self.sprat_max_incidence))
+
+            if not np.any(vsp):
+                phi_sprat = np.zeros(n_mt, dtype=np.float64)
+            elif self.sprat_offset == 'fit':
+                diff = obs_log[vsp][None, :] - sprat_theo[:, vsp]
+                w_vsp = w_sprat[vsp]
+                if self.norm_sprat == 'L1':
+                    c = _weighted_median_rows(diff, w_vsp)
+                else:  # 'L2'
+                    c = np.sum(diff * w_vsp[None, :], axis=1) / np.sum(w_vsp)
+                phi_sprat = _weighted_misfit_term(
+                    obs_log[vsp], sprat_theo[:, vsp] + c[:, None], w_vsp,
+                    norm=self.norm_sprat)
+            else:
+                phi_sprat = _weighted_misfit_term(
+                    obs_log[vsp], sprat_theo[:, vsp], w_sprat[vsp],
+                    norm=self.norm_sprat)
         else:
             phi_sprat = np.zeros(n_mt, dtype=np.float64)
 
@@ -314,22 +574,61 @@ class PolarityRelPampMisfit(object):
         raise NotImplementedError('Only MomentTensor sources are supported')
 
     def _takeoff_incidence(self, greens):
-        if self.method != 'taup':
-            raise NotImplementedError("Only method='taup' is implemented")
-        n = len(greens)
-        takeoff = np.zeros(n, dtype=np.float64)
-        incidence = np.zeros(n, dtype=np.float64)
-        for i, g in enumerate(greens):
-            depth_km = g.origin.depth_in_m / 1000.0
-            deg = _distance_in_degrees(g)
-            takeoff[i], incidence[i] = _takeoff_incidence_taup(
-                self._taup, depth_km, deg)
-        return takeoff, incidence
+        if self.method == 'precomputed':
+            n = len(greens)
+            takeoff = np.zeros(n, dtype=np.float64)
+            incidence = np.zeros(n, dtype=np.float64)
+            for i, g in enumerate(greens):
+                sta = getattr(g, 'station', None)
+                sta_name = getattr(sta, 'station', str(i)) if sta is not None else str(i)
+                to = getattr(g, 'takeoff_angle', None)
+                if to is None and isinstance(g, dict):
+                    to = g.get('takeoff_angle')
+                if to is None:
+                    raise ValueError("Missing 'takeoff_angle' for station %s" % sta_name)
+
+                inc = getattr(g, 'incidence_angle', None)
+                if inc is None and isinstance(g, dict):
+                    inc = g.get('incidence_angle')
+                if inc is None:
+                    raise ValueError("Missing 'incidence_angle' for station %s" % sta_name)
+
+                takeoff[i] = float(to)
+                incidence[i] = float(inc)
+            return takeoff, incidence
+        elif self.method == 'taup':
+            n = len(greens)
+            takeoff = np.zeros(n, dtype=np.float64)
+            incidence = np.zeros(n, dtype=np.float64)
+            for i, g in enumerate(greens):
+                depth_km = g.origin.depth_in_m / 1000.0
+                deg = _distance_in_degrees(g)
+                takeoff[i], incidence[i] = _takeoff_incidence_taup(
+                    self._taup, depth_km, deg)
+            return takeoff, incidence
+        else:
+            raise NotImplementedError("Only method='taup' or 'precomputed' is implemented")
 
     def _azimuths(self, greens):
         return np.array([g.azimuth for g in greens], dtype=np.float64)
 
     def _distances_m(self, greens):
+        if self.method == 'precomputed':
+            if self.distance_mode == 'ray_path':
+                out = np.zeros(len(greens), dtype=np.float64)
+                for i, g in enumerate(greens):
+                    sta = getattr(g, 'station', None)
+                    sta_name = getattr(sta, 'station', str(i)) if sta is not None else str(i)
+                    rl = getattr(g, 'ray_length_in_m', None)
+                    if rl is None and isinstance(g, dict):
+                        rl = g.get('ray_length_in_m')
+                    if rl is None:
+                        raise ValueError("Missing 'ray_length_in_m' for station %s" % sta_name)
+                    out[i] = float(rl)
+                return out
+            else:
+                return np.array([g.distance_in_m for g in greens], dtype=np.float64)
+
         dist = np.array([g.distance_in_m for g in greens], dtype=np.float64)
         if self.distance_mode == 'ray_path' and self.method == 'taup':
             try:
@@ -345,6 +644,18 @@ class PolarityRelPampMisfit(object):
         if self._vp_user is not None and self._vs_user is not None:
             return np.full(len(greens),
                            float(self._vp_user) / float(self._vs_user))
+        if self.method == 'precomputed':
+            out = np.zeros(len(greens), dtype=np.float64)
+            for i, g in enumerate(greens):
+                sta = getattr(g, 'station', None)
+                sta_name = getattr(sta, 'station', str(i)) if sta is not None else str(i)
+                vov = getattr(g, 'vp_over_vs', None)
+                if vov is None and isinstance(g, dict):
+                    vov = g.get('vp_over_vs')
+                if vov is None:
+                    raise ValueError("Missing 'vp_over_vs' for station %s" % sta_name)
+                out[i] = float(vov)
+            return out
         if self.method != 'taup':
             raise NotImplementedError(
                 "vp/vs requires method='taup' or explicit vp and vs")
@@ -359,6 +670,50 @@ class PolarityRelPampMisfit(object):
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+def _weighted_median_rows(values_2d, weights_1d):
+    """ Vectorized weighted median of each row of values_2d with weights_1d.
+
+    Parameters
+    ----------
+    values_2d : array-like, shape (n_rows, n_cols)
+        Values for which the weighted median is computed per row.
+    weights_1d : array-like, shape (n_cols,)
+        Non-negative 1D weights corresponding to columns.
+
+    Returns
+    -------
+    medians : ndarray, shape (n_rows,)
+        Lower weighted median of each row (where cumulative weight reaches or
+        exceeds 50% of the total weight).
+
+    Notes
+    -----
+    If weights sum to zero or n_cols == 0, returns zeros of shape (n_rows,).
+    Uses the lower weighted median convention when the threshold falls exactly
+    on an accumulated weight step.
+    """
+    vals = np.asarray(values_2d, dtype=np.float64)
+    if vals.ndim == 1:
+        vals = vals.reshape((1, -1))
+    n_rows, n_cols = vals.shape
+
+    w = np.asarray(weights_1d, dtype=np.float64).ravel()
+    tot_w = np.sum(w)
+    if n_cols == 0 or tot_w <= 0.0:
+        return np.zeros(n_rows, dtype=np.float64)
+
+    sort_idx = np.argsort(vals, axis=1)
+    sorted_vals = np.take_along_axis(vals, sort_idx, axis=1)
+    sorted_w = np.take_along_axis(w[None, :], sort_idx, axis=1)
+
+    cum_w = np.cumsum(sorted_w, axis=1)
+    threshold = 0.5 * tot_w
+    mask = cum_w >= threshold
+    first_idx = np.argmax(mask, axis=1)
+
+    return sorted_vals[np.arange(n_rows), first_idx]
+
 
 def _s_over_p_log10_mt(mt_array_use, takeoff, azimuth, vp_over_vs):
     """ Far-field log10(S/P) amplitude ratio for USE moment tensors.
@@ -603,7 +958,7 @@ def _pol_pamp_mt(mt_array_use, takeoff, azimuth, spreading=None,
     polarities : array (n_mt, n_sta)   # +1 / -1 / 0, sign of the P radiation
     p_amp      : array (n_mt, n_sta)   # signed P amplitude (spreading/projection applied)
 
-    Hook: SV/SH radiation and an S/P-ratio term would be added here in future.
+    Note: SV/SH radiation and S/P amplitude ratios are computed in :func:`_s_over_p_log10_mt`.
     """
     mt = np.asarray(mt_array_use, dtype=np.float64)
     if mt.ndim == 1:
